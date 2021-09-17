@@ -33,9 +33,7 @@ class TabularHierarchicalAgentV3(TabularHierarchicalAgent, ABC):
     def __init__(self, observation_shape: typing.Tuple, n_actions: int, n_levels: int,
                  horizons: typing.Union[typing.List[int]], discount: float = 0.95,
                  lr: float = 0.5, epsilon: float = 0.1, lr_decay: float = 0.0, greedy_options: bool = False,
-                 greedy_training: bool = False,
-                 relative_actions: bool = False, relative_goals: bool = False, universal_top: bool = False,
-                 shortest_path_rewards: bool = False, sarsa: bool = False, stationary_filtering: bool = True,
+                 greedy_training: bool = False, sarsa: bool = False, stationary_filtering: bool = True,
                  hindsight_goals: bool = True, legal_states: np.ndarray = None, **kwargs) -> None:
         super().__init__(observation_shape=observation_shape, n_actions=n_actions, n_levels=n_levels, **kwargs)
 
@@ -77,62 +75,10 @@ class TabularHierarchicalAgentV3(TabularHierarchicalAgent, ABC):
         self.source.reset()
         self.flat.reset()
 
-    def _to_neighborhood(self, radii: typing.List, mask_center: bool = True) -> typing.Tuple[typing.List, typing.List]:
-        """ Correct the current absolute action space parameterization to a relative/ bounded action space. """
-        relative_indices = [np.arange(
-            neumann_neighborhood_size(r) if self.motion == Agent._NEUMANN_MOTION else moore_neighborhood_size(r)
-        ) for r in radii]
-
-        # Correct action-to-coordinate map to state space index for each level: f_i(A | S) -> S
-        relative_coordinates = list()
-        for i in range(1, self.n_levels):
-            shifts = (   # First gather all relative coordinate displacements for each state.
-                unravel_neumann_index(relative_indices[i - 1], radius=radii[i - 1], delta=True)
-                if self.motion == Agent._NEUMANN_MOTION else
-                unravel_moore_index(relative_indices[i - 1], radius=radii[i - 1], delta=True))
-
-            neighborhood_states = list()
-            for center in self.S_xy:
-                coords = center + shifts  # All reachable coordinates from state 'center'
-
-                # Mask out out of bound actions.
-                mask = np.all((0, 0) <= coords, axis=-1) & np.all(coords < self.observation_shape, axis=-1)
-                if mask_center:
-                    mask[len(coords) // 2] = 0  # Do nothing action.
-
-                states = TabularHierarchicalAgentV3._ILLEGAL * np.ones(len(coords))
-                states[mask] = self._get_index(coords[mask].T)
-
-                neighborhood_states.append(states.astype(np.int32))
-
-            # Override current (absolute) mapping to their corrected displacements.
-            relative_coordinates.append(neighborhood_states)
-
-        return relative_indices, relative_coordinates
-
-    @staticmethod
-    def ravel_delta_indices(center_deltas: np.ndarray, r: int, motion: int) -> np.ndarray:
-        if motion == Agent._MOORE_MOTION:
-            return ravel_moore_index(center_deltas, radius=r, delta=True)
-        else:
-            return ravel_neumann_index(center_deltas, radius=r, delta=True)
-
     @staticmethod
     def inside_radius(a: np.ndarray, b: np.ndarray, r: int, motion: int) -> bool:
         """ Check whether the given arrays 'a' and 'b' are contained within the radius dependent on the motion. """
         return (manhattan_distance(a, b) if motion == Agent._NEUMANN_MOTION else chebyshev_distance(a, b)) < r
-
-    def goal_reachable(self, level: int, state: int, goal: int) -> bool:
-        if not self.relative_goals:
-            return True
-        return self.inside_radius(self.S_xy[state], self.S_xy[goal], r=self.atomic_horizons[level], motion=self.motion)
-
-    def convert_action(self, level: int, reference: int, displaced: int, to_absolute: bool = False) -> int:
-        if to_absolute:
-            return self.A_xy[level][reference][displaced]
-        else:
-            return self.ravel_delta_indices((self.S_xy[displaced] - self.S_xy[reference])[None, :],
-                                            r=self.atomic_horizons[level], motion=self.motion).item()
 
     def _get_index(self, coord: typing.Tuple, dims: typing.Optional[typing.Tuple[int, int]] = None) -> int:
         return np.ravel_multi_index(coord, dims=self.observation_shape if dims is None else dims)
@@ -185,7 +131,7 @@ class TabularHierarchicalAgentV3(TabularHierarchicalAgent, ABC):
                     return a
 
 
-class HierQV2(TabularHierarchicalAgentV3):
+class HierQV3(TabularHierarchicalAgentV3):
     _TEST_EPSILON: float = 0.05
 
     def policy_hook(function: typing.Callable) -> typing.Callable:
@@ -198,7 +144,7 @@ class HierQV2(TabularHierarchicalAgentV3):
         return _policy_hook
 
     def __init__(self, observation_shape: typing.Tuple, n_actions: int, n_levels: int,
-                 horizons: typing.Union[typing.List[int]], discount: float = 0.95,
+                 horizons: typing.Union[typing.List[int]], discount: float = 0.95, decay: float = 0.9,
                  lr: float = 0.5, epsilon: float = 0.1, lr_decay: float = 0.0, greedy_options: bool = False,
                  relative_actions: bool = False, relative_goals: bool = False, universal_top: bool = False,
                  shortest_path_rewards: bool = False, sarsa: bool = False, stationary_filtering: bool = True,
@@ -212,6 +158,11 @@ class HierQV2(TabularHierarchicalAgentV3):
         )
         # Environment path to take overriding the agent policy (useful for debugging or visualization)
         self._path: typing.List[int] = None
+
+        self.decay = decay
+
+        self.strace = np.zeros(len(self.S), dtype=np.float32)
+        self.qtrace = np.zeros((len(self.S), len(self.S), self.n_actions), dtype=np.float32)
 
         # Data structures for keeping track of an environment trace along with a deque that retains previous
         # states within the hierarchical policies' action horizon. Last atomic_horizon value should be large.
@@ -228,84 +179,41 @@ class HierQV2(TabularHierarchicalAgentV3):
     def get_level_action(self, s: int, g: int, level: int, explore: bool = True) -> typing.Tuple[int, float]:
         """Sample a **Hierarchy action** (not an Environment action) from the Agent. """
         # Helper variables
-        gc = g * int(self.critics[level].goal_conditioned)  # TODO: g to relative index
-
-        if level == 0:  # Epsilon greedy
-            eps = self.epsilon[0] if explore else self._TEST_EPSILON
-            if eps > np.random.rand():
-                a = np.random.randint(self.n_actions)
-            else:
-                optimal = np.flatnonzero(self.critics[level].table[s, gc] == self.critics[level].table[s, gc].max())
-                a = np.random.choice(optimal)
-
-            return a, self.critics[level].table[s, gc, a]
-
-        greedy = int((not explore) or (np.random.rand() > self.epsilon[level]))
-
-        pref = g if level else None          # Goal-selection bias for shared max Q-values.
-        if level and self.relative_actions:  # Action Preference: Absolute-to-Neighborhood for policy Action-Space
-            pref = None
-            if self.inside_radius(self.S_xy[s], self.S_xy[g], r=self.atomic_horizons[level], motion=self.motion):
-                pref = self.ravel_delta_indices(center_deltas=np.diff([self.S_xy[s], self.S_xy[g]]).T,
-                                                r=self.atomic_horizons[level], motion=self.motion).item()
-
-        mask = np.ones_like(self.critics[level].table[s, gc], dtype=bool)
-        if level:  # Prune/ correct action space by masking out-of-bound or illegal subgoals.
-            if self.relative_actions:
-                mask = self.A_xy[level][s] != HierQV2._ILLEGAL
-            else:
-                mask[s] = 0  # Do nothing is illegal.
+        gc = g * int(self.critics[level].goal_conditioned)
+        greedy = int((not level) or (not explore) or (np.random.rand() > self.epsilon[level]))
 
         # Sample an action (with preference for the end-goal if goal-conditioned policy).
         action = rand_argmax(self.critics[level].table[s, gc] * greedy, preference=pref, mask=mask)
         value = self.critics[level].table[s, gc, action]
 
-        if level and self.relative_actions:  # Neighborhood-to-Absolute for sampled action.
-            action = self.convert_action(level, reference=s, displaced=action, to_absolute=True)
-
         return action, value
 
-    def update_tables(self) -> None:
-        # Update Q tables at each level using built trace.
-        for i in range(0, self.n_levels):
-            self.update_table(level=i, horizon=self.trace.window(i), trace=self.trace.raw)
-
-    def update_table(self, level: int, horizon: int, trace: typing.Sequence[GoalTransition], **kwargs) -> None:
+    def update_table(self, trace: typing.Sequence[GoalTransition], **kwargs) -> None:
         """Update Q-Tables with given transition """
-        s_next, end_pos = trace[-1].next_state, trace[-1].goal[0]
-        for h in reversed(range(horizon)):
-            s = trace[-(h + 1)].state
-            a = s_next if level else trace[-1].action
+        s_next = trace[-1].next_state
+        s, a, g = trace[-1].state, trace[-1].action, s_next
 
-            if level and self.relative_actions:  # Convert goal-action 'a' from Absolute-to-Neighborhood.
-                a = self.convert_action(level, reference=s, displaced=s_next)
+        # Apply sampled Bellman operator over all goals
+        r = (self.S == g)
+        gamma = self.discount * r
+        tq = np.amax(self.flat.table[s_next, self.S], axis=-1)
 
-            # Hindsight action transition mask.
-            if self.critics[level].goal_conditioned and (not self.hindsight_goals):
-                # Single-Update: Only update goal-table for the current state-goal.
-                goals, mask = (s_next, 1)
-            else:
-                # Multi-Update: Update all possible goals simultaneously for goal-conditioned tables.
-                goals, mask = (self.G[level], self.G[level] == s_next) \
-                    if self.critics[level].goal_conditioned else (self.G[level], end_pos == s_next)
+        # delta = T*Q - Q
+        delta = (r + gamma * tq) - self.flat.table[s, self.S, a]
 
-            # Q-Learning update for each goal-state.
-            bootstrap = np.amax(self.critics[level].table[s_next, goals], axis=-1)
-            if self.sarsa:
-                if (self.epsilon[level] * int(level == 0)) > np.random.rand():
-                    Q_t = self.critics[level].table[s, goals, np.random.randint(len(self.A[level]))]
-                # Expected SARSA target.
-                # p = self.epsilon[level]
-                # bootstrap = p * self.critics[level].table[s_next, goals].mean(axis=-1) + (1 - p) * bootstrap
+        # Update eligibilities
+        pis = (self.flat.table[s_next, self.S].max(axis=1) == self.flat.table[s_next, self.S, a])
+        self.qtrace = (pis * gamma * self.decay) * self.qtrace
+        self.qtrace[s, self.S, a] = 1.0
 
-            ys = self.reward_func(mask, bootstrap)
-            delta = ys - self.critics[level].table[s, goals, a]
-            if self.relative_goals or (not self.hindsight_goals):
-                if self.critics[level].goal_conditioned:
-                    # Bounded goals: Only update goal-table for the in-range goals
-                    delta[self.goal_mask[level][s]] = 0
+        # Watkin's Q(lambda) update for all goals simultaneously
+        self.flat.table[s, self.S, a] += self.lr * self.qtrace * delta
 
-            self.critics[level].table[s, goals, a] += self.lr * delta
+        # Update Source map using backward memory vector s.t., column i of S yields S_(:,i) = E[z]
+        self.strace = self.strace * self.decay * self.discount
+        self.strace[s] = 1
+
+        self.source.table[self.S, s] += self.lr * (self.strace - self.source.table[self.S, s])
 
     def update(self, _env: gym.Env, level: int, state: int, goal_stack: typing.List[int],
                value_stack: typing.List[float]) -> typing.Tuple[int, bool]:
@@ -313,12 +221,6 @@ class HierQV2(TabularHierarchicalAgentV3):
         """
         step, done = 0, False
         while (step < self.horizons[level]) and (state not in goal_stack) and (not done):
-            if self.greedy_training:
-                term = [self.terminate_option(i, state, goal_stack[self.n_levels - i - 1], value_stack[self.n_levels - i])
-                        for i in range(level + 1, self.n_levels)]
-                if any(term):
-                    break
-
             # Sample an action at the current hierarchy level.
             a, v = self.get_level_action(s=state, g=goal_stack[-1], level=level)
 
@@ -332,14 +234,8 @@ class HierQV2(TabularHierarchicalAgentV3):
                 self.trace.add(GoalTransition(
                     state=state, goal=tuple(goal_stack), action=a, next_state=s_next, terminal=terminal, reward=r))
 
-                # Update Q-tables given the current (global) trace of experience.
-                # Always update the i = 0 table and either always update i > 0 tables or only on state-transitions.
-                raw = self.trace.raw[-1].degenerate  # : s == s_next
-                for i in range((self.n_levels if (not raw or (not self.stationary_filtering)) else 1)):
-                    if (i == 0) or (not self.stationary_filtering):
-                        self.update_table(level=i, horizon=self.trace.window(i, raw=True), trace=self.trace.raw)
-                    else:
-                        self.update_table(level=i, horizon=self.trace.window(i), trace=self.trace.transitions)
+                # Update tables given the current trace of experience.
+                self.update_table(self.trace.raw)
 
             # Update state of control. Terminate level if new state is out of reach of current goal.
             state = s_next
