@@ -31,9 +31,9 @@ class TabularHierarchicalAgentV3(TabularHierarchicalAgent, ABC):
     _GOAL_PADDING: int = 1
 
     def __init__(self, observation_shape: typing.Tuple, n_actions: int, n_levels: int,
-                 horizons: typing.Union[typing.List[int]], discount: float = 0.95,
-                 lr: float = 0.5, epsilon: float = 0.1, lr_decay: float = 0.0, greedy_options: bool = False,
-                 greedy_training: bool = False, sarsa: bool = False, stationary_filtering: bool = True,
+                 horizons: typing.Union[typing.List[int]], discount: float = 0.95, alpha: float = 0.5,
+                 beta: float = 0.5, epsilon: float = 0.1, alpha_decay: float = 0.0, beta_decay: float = 0.0,
+                 greedy_options: bool = False, greedy_training: bool = False, sarsa: bool = False,
                  hindsight_goals: bool = True, legal_states: np.ndarray = None, **kwargs) -> None:
         super().__init__(observation_shape=observation_shape, n_actions=n_actions, n_levels=n_levels, **kwargs)
 
@@ -42,8 +42,11 @@ class TabularHierarchicalAgentV3(TabularHierarchicalAgent, ABC):
             f"this should either be a fixed integer or a list in ascending hierarchy order."
 
         # Learning parameters
-        self.lr_base = self.lr = lr
-        self.lr_decay = lr_decay
+        self.alpha_base = self.alpha = alpha
+        self.alpha_decay = alpha_decay
+        self.beta_base = self.beta = beta
+        self.beta_decay = beta_decay
+
         self.discount = discount
         self.sarsa = sarsa
 
@@ -85,7 +88,7 @@ class TabularHierarchicalAgentV3(TabularHierarchicalAgent, ABC):
 
     def reset(self, full_reset: bool = False) -> None:
         self.clear_hierarchy(self.n_levels - 1 - int(not full_reset))
-        self.lr = self.lr_base
+        self.alpha = self.alpha_base
         self.episodes = 0
         self.source.reset()
         self.flat.reset()
@@ -179,14 +182,21 @@ class HierQV3(TabularHierarchicalAgentV3):
     def get_level_action(self, s: int, g: int, level: int, explore: bool = True) -> typing.Tuple[int, float]:
         """Sample a **Hierarchy action** (not an Environment action) from the Agent. """
         # Helper variables
-        gc = g * int(self.critics[level].goal_conditioned)
         greedy = int((not level) or (not explore) or (np.random.rand() > self.epsilon[level]))
 
-        # Sample an action (with preference for the end-goal if goal-conditioned policy).
-        action = rand_argmax(self.critics[level].table[s, gc] * greedy, preference=pref, mask=mask)
-        value = self.critics[level].table[s, gc, action]
+        if level == 0:  # Goal Conditioned Atomic policy --> for goal 'g' follow the optimal SR
+            a = rand_argmax(self.flat.table[s, g, self.A_flat] * greedy)
+            return a, self.flat.table[s, g, a]
 
-        return action, value
+        neighborhood = self.A_hierarchical[level]  # State neighborhood defined as the k-hop nodes (on a lattice)
+        if g in neighborhood:  # Directly move towards level goal if it is in reach.
+            return g, 1.0
+
+        # Multilevel Hierarchy derived from the Source map/ SR Matrix --> yields pseudo Q(s, a) values.
+        qs = self.source.table[neighborhood, g]
+
+        a = rand_argmax(qs * greedy)
+        return a, self.source.table[a, g]
 
     def update_table(self, trace: typing.Sequence[GoalTransition], **kwargs) -> None:
         """Update Q-Tables with given transition """
@@ -207,13 +217,13 @@ class HierQV3(TabularHierarchicalAgentV3):
         self.qtrace[s, self.S, a] = 1.0
 
         # Watkin's Q(lambda) update for all goals simultaneously
-        self.flat.table[s, self.S, a] += self.lr * self.qtrace * delta
+        self.flat.table[s, self.S, a] += self.alpha * self.qtrace * delta
 
         # Update Source map using backward memory vector s.t., column i of S yields S_(:,i) = E[z]
         self.strace = self.strace * self.decay * self.discount
         self.strace[s] = 1
 
-        self.source.table[self.S, s] += self.lr * (self.strace - self.source.table[self.S, s])
+        self.source.table[self.S, s] += self.beta * (self.strace - self.source.table[self.S, s])
 
     def update(self, _env: gym.Env, level: int, state: int, goal_stack: typing.List[int],
                value_stack: typing.List[float]) -> typing.Tuple[int, bool]:
@@ -225,7 +235,8 @@ class HierQV3(TabularHierarchicalAgentV3):
             a, v = self.get_level_action(s=state, g=goal_stack[-1], level=level)
 
             if level:  # Temporally extend action as a goal through recursion.
-                s_next, done = self.update(_env=_env, level=level - 1, state=state, goal_stack=goal_stack + [a], value_stack=value_stack + [v])
+                s_next, done = self.update(_env=_env, level=level - 1, state=state, goal_stack=goal_stack + [a],
+                                           value_stack=value_stack + [v])
             else:  # Atomic level: Perform a step in the actual environment, and perform critic-table updates.
                 next_obs, r, done, meta = _env.step(a)
                 s_next, terminal = self._get_index(meta['coord_next']), meta['goal_achieved']
@@ -246,8 +257,12 @@ class HierQV3(TabularHierarchicalAgentV3):
     def update_training_variables(self) -> None:
         # Clear all trailing states in each policy's deque.
         self.trace.reset()
-        if 0.0 < self.lr_decay <= 1.0 and self.episodes:  # Decay according to lr_base * 1/(num_episodes ^ decay)
-            self.lr = self.lr_base / (self.episodes ** self.lr_decay)
+        if 0.0 < self.alpha_decay <= 1.0 and self.episodes:  # Decay according to lr_base * 1/(num_episodes ^ decay)
+            self.alpha = self.alpha_base / (self.episodes ** self.alpha_decay)
+
+        if 0.0 < self.beta_decay <= 1.0 and self.episodes:  # Decay according to lr_base * 1/(num_episodes ^ decay)
+            self.beta = self.beta_base / (self.episodes ** self.beta_decay)
+
         # : add epsilon-decay?
         self.episodes += 1
 

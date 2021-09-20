@@ -7,10 +7,10 @@ import numpy as np
 
 @dataclass
 class GoalTransition:
-    state: np.ndarray
+    state: typing.Union[int, np.ndarray]
     goal: typing.Union[int, np.ndarray]  # Can be intrinsic, extrinsic, a singular goal, or multiple (HER)
     action: int
-    next_state: np.ndarray
+    next_state: typing.Union[int, np.ndarray]
     terminal: bool
     reward: typing.Optional[float]  # Rewards can be extrinsic or derived from (state == goal).
 
