@@ -79,9 +79,17 @@ class TabularHierarchicalAgentV3(TabularHierarchicalAgent, ABC):
         self.flat.reset()
 
     @staticmethod
-    def inside_radius(a: np.ndarray, b: np.ndarray, r: int, motion: int) -> bool:
-        """ Check whether the given arrays 'a' and 'b' are contained within the radius dependent on the motion. """
-        return (manhattan_distance(a, b) if motion == Agent._NEUMANN_MOTION else chebyshev_distance(a, b)) < r
+    def create_lattice_neighborhoods(nodes: np.ndarray, dims: typing.Tuple[int, int], k: int, norm: int) -> typing.List:
+        distance = manhattan_distance if norm == Agent._NEUMANN_MOTION else chebyshev_distance
+
+        # Sweep nodes O(|S|^2) to find all k-hop neighbors for each node on a lattice.
+        states = list()
+        for node in nodes:
+            for neighbor in nodes:
+                if node != neighbor:
+                    if distance(*np.unravel_index([node, neighbor], shape=dims)) < k:
+                        states.append(neighbor)
+        return states
 
     def _get_index(self, coord: typing.Tuple, dims: typing.Optional[typing.Tuple[int, int]] = None) -> int:
         return np.ravel_multi_index(coord, dims=self.observation_shape if dims is None else dims)
@@ -89,6 +97,7 @@ class TabularHierarchicalAgentV3(TabularHierarchicalAgent, ABC):
     def reset(self, full_reset: bool = False) -> None:
         self.clear_hierarchy(self.n_levels - 1 - int(not full_reset))
         self.alpha = self.alpha_base
+        self.beta = self.beta_base
         self.episodes = 0
         self.source.reset()
         self.flat.reset()
@@ -100,8 +109,9 @@ class TabularHierarchicalAgentV3(TabularHierarchicalAgent, ABC):
         if not self.greedy_options:
             return False
 
-        goal = goal * int(self.critics[level].goal_conditioned)
-        return value < self.critics[level].table[state, goal].max()
+        # Extract pseudo Q(s, a) values based on the SR-values towards 'goal'.
+        qs = self.source.table[self.A_hierarchical[level - 1][state], goal]
+        return value < qs.max()
 
     def sample(self, state: np.ndarray, behaviour_policy: bool = True) -> int:
         """Sample an **Environment action** (not a goal) from the Agent. """
@@ -188,7 +198,7 @@ class HierQV3(TabularHierarchicalAgentV3):
             a = rand_argmax(self.flat.table[s, g, self.A_flat] * greedy)
             return a, self.flat.table[s, g, a]
 
-        neighborhood = self.A_hierarchical[level]  # State neighborhood defined as the k-hop nodes (on a lattice)
+        neighborhood = self.A_hierarchical[level - 1][s]  # Get all states within a k-hop node vicinity (on a lattice)
         if g in neighborhood:  # Directly move towards level goal if it is in reach.
             return g, 1.0
 
@@ -198,7 +208,7 @@ class HierQV3(TabularHierarchicalAgentV3):
         a = rand_argmax(qs * greedy)
         return a, self.source.table[a, g]
 
-    def update_table(self, trace: typing.Sequence[GoalTransition], **kwargs) -> None:
+    def update_tables(self, trace: typing.Sequence[GoalTransition], **kwargs) -> None:
         """Update Q-Tables with given transition """
         s_next = trace[-1].next_state
         s, a, g = trace[-1].state, trace[-1].action, s_next
@@ -206,10 +216,10 @@ class HierQV3(TabularHierarchicalAgentV3):
         # Apply sampled Bellman operator over all goals
         r = (self.S == g)
         gamma = self.discount * r
-        tq = np.amax(self.flat.table[s_next, self.S], axis=-1)
+        pq = np.amax(self.flat.table[s_next, self.S], axis=-1)
 
-        # delta = T*Q - Q
-        delta = (r + gamma * tq) - self.flat.table[s, self.S, a]
+        # delta ~ T*Q - Q
+        delta = (r + gamma * pq) - self.flat.table[s, self.S, a]
 
         # Update eligibilities
         pis = (self.flat.table[s_next, self.S].max(axis=1) == self.flat.table[s_next, self.S, a])
@@ -246,7 +256,7 @@ class HierQV3(TabularHierarchicalAgentV3):
                     state=state, goal=tuple(goal_stack), action=a, next_state=s_next, terminal=terminal, reward=r))
 
                 # Update tables given the current trace of experience.
-                self.update_table(self.trace.raw)
+                self.update_tables(self.trace.raw)
 
             # Update state of control. Terminate level if new state is out of reach of current goal.
             state = s_next
@@ -257,6 +267,7 @@ class HierQV3(TabularHierarchicalAgentV3):
     def update_training_variables(self) -> None:
         # Clear all trailing states in each policy's deque.
         self.trace.reset()
+
         if 0.0 < self.alpha_decay <= 1.0 and self.episodes:  # Decay according to lr_base * 1/(num_episodes ^ decay)
             self.alpha = self.alpha_base / (self.episodes ** self.alpha_decay)
 
