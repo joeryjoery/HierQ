@@ -69,7 +69,9 @@ class TabularHierarchicalAgentV3(TabularHierarchicalAgent, ABC):
         # Initialize the agent's state space, goal space and action space.
         self.S, self.S_legal = np.arange(np.prod(observation_shape)), legal_states
         self.A_flat = np.arange(self.n_actions)
-        self.A_hierarchical = []  # TODO: Create neighborhoods for each state s at each level i (bounded by |S|^2).
+        self.A_hierarchical = [
+            self.create_lattice_neighborhoods(self.S, k) for k in self.atomic_horizons
+        ]
 
         # Initialize Hierarchical Q-table as the Source map along with a goal-conditioned flat Q-table
         self.source = CriticTable(0, (len(self.S), len(self.S)), goal_conditioned=False)
@@ -78,16 +80,15 @@ class TabularHierarchicalAgentV3(TabularHierarchicalAgent, ABC):
         self.source.reset()
         self.flat.reset()
 
-    @staticmethod
-    def create_lattice_neighborhoods(nodes: np.ndarray, dims: typing.Tuple[int, int], k: int, norm: int) -> typing.List:
-        distance = manhattan_distance if norm == Agent._NEUMANN_MOTION else chebyshev_distance
+    def create_lattice_neighborhoods(self, nodes: np.ndarray, k: int, norm: int) -> typing.List:
+        distance = manhattan_distance if self.motion == Agent._NEUMANN_MOTION else chebyshev_distance
 
         # Sweep nodes O(|S|^2) to find all k-hop neighbors for each node on a lattice.
         states = list()
         for node in nodes:
             for neighbor in nodes:
                 if node != neighbor:
-                    if distance(*np.unravel_index([node, neighbor], shape=dims)) < k:
+                    if distance(*np.unravel_index([node, neighbor], shape=self.observation_shape)) < k:
                         states.append(neighbor)
         return states
 
