@@ -22,8 +22,7 @@ from .HierQ import TabularHierarchicalAgent
 from .utils import CriticTable, GoalTransition, HierarchicalTrace
 
 from mazelab_experimenter.utils import rand_argmax, get_pos
-from mazelab_experimenter.utils import ravel_moore_index, ravel_neumann_index, unravel_moore_index, \
-    unravel_neumann_index, manhattan_distance, chebyshev_distance, neumann_neighborhood_size, moore_neighborhood_size
+from mazelab_experimenter.utils import manhattan_distance, chebyshev_distance
 
 
 class TabularHierarchicalAgentV3(TabularHierarchicalAgent, ABC):
@@ -70,7 +69,7 @@ class TabularHierarchicalAgentV3(TabularHierarchicalAgent, ABC):
         self.S, self.S_legal = np.arange(np.prod(observation_shape)), legal_states
         self.A_flat = np.arange(self.n_actions)
         self.A_hierarchical = [
-            self.create_lattice_neighborhoods(self.S, k) for k in self.atomic_horizons
+            self.create_lattice_neighborhoods(self.S, k) for k in self.atomic_horizons[1:]
         ]
 
         # Initialize Hierarchical Q-table as the Source map along with a goal-conditioned flat Q-table
