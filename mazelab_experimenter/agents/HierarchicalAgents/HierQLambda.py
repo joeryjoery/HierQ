@@ -8,7 +8,6 @@ from .utils import GoalTransition, HierarchicalEligibilityTrace
 
 
 class HierQLambda(HierQV2):
-    # TODO: relative goal functionality.
 
     def __init__(self, observation_shape: typing.Tuple, n_actions: int, n_levels: int,
                  horizons: typing.Union[typing.List[int]], lr: float = 0.5, epsilon: float = 0.1,
@@ -27,7 +26,7 @@ class HierQLambda(HierQV2):
         # Lambda value for decaying compound returns inside the eligibility trace.
         self.decay = decay
         # Whether to include trailing (non-optimal horizon) state-action pairs within the trace.
-        self.sparse_traces = sparse_traces  # TODO
+        self.sparse_traces = sparse_traces
 
         # Initialize for each hierarchy level its individual Hierarchical-Eligibility trace.
         self.eligibility = list()
