@@ -23,10 +23,8 @@ class HierQS(HierQV3):
 
         # Flat eligibility
         self.z = np.zeros((len(self.S), self.n_actions, len(self.G)), dtype=np.float32)
-        # Hierarchical state-eligibility for each level (to correct decay of the trace).
-        self.x = [np.zeros(len(self.S), dtype=np.float32) for i in range(self.n_levels - 1)]
-        # Hierarchical state-correction for each level and for each maximum horizon.
-        self.w = [[np.ones((len(self.S), len(self.G)), dtype=np.float32)
+        # Hierarchical Eligibility Trace for each level and for each maximum horizon.
+        self.w = [[np.zeros((len(self.S), len(self.G)), dtype=np.float32)
                    for _ in range(self.atomic_horizons[i + 1])]
                   for i in range(self.n_levels - 1)]
 
@@ -59,18 +57,15 @@ class HierQS(HierQV3):
             h = (len(trace) - 1) % h_atomic
             s_h = trace[-h_atomic].state
 
-            # Update state-recencies 'x'.
-            self.x[i] *= self.decay * (self.discount ** (1.0 / self.atomic_horizons[i + 1]))
-            self.x[i][s_next] = 1.0
-
             # Construct a per-goal mask for a == s_next --> greedy action state s_h.
             n_k_prev = self.U[i][s_h]
             q_greedy = c.table[n_k_prev].max(axis=0) if len(n_k_prev) else c.table[s_next]
             pi_h = (c.table[s_next] == q_greedy)
 
-            # Update policy corrections 'w'.
+            # Update Eligibility Trace 'w'.
             self.w[i][h][..., s_h] = 0.0   # Cut state-trace behind previously achieved state-goal.
             self.w[i][h][:, ~pi_h] = 0.0   # Policy correction: Cut goal-traces
+            self.w[i][h][:, pi_h] *= self.decay * self.discount
             self.w[i][h][s_next, :] = 1.0  # Add state to all goal-traces.
 
             # Compute Update Target.
@@ -79,11 +74,8 @@ class HierQS(HierQV3):
             TQ = mask + (1 - mask) * self.discount * bootstrap
             delta = TQ - c.table[s_next]
 
-            # Construct eligibilities 'z' by casting 'x' column-wise over 'w'.
-            z = self.w[i][h] * self.x[i][:, None]
-
             # Update table by casting TD-errors (delta) row-wise over eligibility trace 'z'.
-            c.table += self.lr * z * delta
+            c.table += self.lr * self.w[i][h] * delta
 
             # Add 'next_state' as a valid action to all separate eligibility traces.
             for wj in self.w[i]:
@@ -95,7 +87,6 @@ class HierQS(HierQV3):
         self.trace.reset()
 
         self.z[...] = 0.0
-        for i in range(self.n_levels - 1):
-            self.x[i][...] = 0.0
-            for h_w in self.w[i]:
-                h_w[...] = 1.0
+        for w_l in self.w:
+            for w_h in w_l:
+                w_h[...] = 0.0

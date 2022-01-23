@@ -18,16 +18,10 @@ class HierQN(HierQV2):
     def __init__(self, observation_shape: typing.Tuple, n_actions: int, n_levels: int,
                  horizons: typing.Union[typing.List[int]], lr: float = 0.5, epsilon: float = 0.1,
                  discount: float = 0.95, n_steps: int = 1, greedy_options: bool = False,
-                 relative_actions: bool = False, relative_goals: bool = False, universal_top: bool = False,
-                 shortest_path_rewards: bool = False, sarsa: bool = False, stationary_filtering: bool = True,
-                 hindsight_targets: bool = True, hindsight_goals: bool = True,
                  legal_states: np.ndarray = None, **kwargs) -> None:
         super().__init__(
             observation_shape=observation_shape, n_actions=n_actions, n_levels=n_levels,
             horizons=horizons, lr=lr, epsilon=epsilon, discount=discount, greedy_options=greedy_options,
-            relative_actions=relative_actions, relative_goals=relative_goals, universal_top=universal_top,
-            hindsight_targets=hindsight_targets, hindsight_goals=hindsight_goals,
-            stationary_filtering=stationary_filtering, shortest_path_rewards=shortest_path_rewards, sarsa=sarsa,
             legal_states=legal_states, **kwargs
         )
         # Number of steps for backing up Q-targets.
@@ -55,15 +49,11 @@ class HierQN(HierQV2):
                 a_i = window[-1].next_state if level else window[-1].action  # shared action identifier.
                 for t in window:
                     s_t, a_t = t.state, a_i  # Extract (s, a) pair for update.
-                    if level and self.relative_actions:  # Action correction for relative action spaces.
+                    if level:  # Action correction for relative action spaces.
                         a_t = self.convert_action(level=level, reference=t.state, displaced=a_i)
 
                     # Perform Q-update over all goals simultaneously for nonzero updates.
                     delta = ys - self.critics[level].table[s_t, self.G[level], a_t]
-                    if self.relative_goals or (not self.hindsight_goals):
-                        if self.critics[level].goal_conditioned:
-                            # Bounded goals: Only update goal-table for the in-range goals
-                            delta[self.goal_mask[level][s_t]] = 0
 
                     delta_mask = (delta != 0.0)
                     self.critics[level].table[s_t, delta_mask, a_t] += self.lr * delta[delta_mask]
@@ -79,21 +69,14 @@ class HierQN(HierQV2):
         r_mask = (s_T == self.G[level]) if self.critics[level].goal_conditioned else (s_T == env_goal)
         Q_T = self.critics[level].table[s_T, self.G[level]].max(axis=-1)
 
-        if self.sarsa:
-            if (self.epsilon[level] * int(level == 0)) > np.random.rand():
-                Q_T = self.critics[level].table[s_T, self.G[level], np.random.randint(len(self.A[level]))]
-            # Expected SARSA target.
-            # p = self.epsilon[level]
-            # Q_T = p * (self.critics[level].table[s_T, self.G[level]]).mean(axis=-1) + (1 - p) * Q_T
-
         # Compute tail target, and perform a n-step Tree Backup (if n > 1) using the greedy policy.
-        G = self.reward_func(r_mask, Q_T)
+        G = r_mask + (1 - r_mask) * self.discount * Q_T
         for k in reversed(range(len(target_transitions) - 1)):
             # Extract (s_k, a_k_next) pair. Abbrev. (s_k, a)
             s_k = target_transitions[k].next_state
             a = target_transitions[k+1].next_state if level else target_transitions[k+1].action
 
-            if level and self.relative_actions:  # Action correction for relative action spaces.
+            if level:  # Action correction for relative action spaces.
                 a = self.convert_action(level, reference=s_k, displaced=a)
 
             # Hindsight targets at every backup step. Line not reachable for non goal conditioned policy.
@@ -101,11 +84,11 @@ class HierQN(HierQV2):
 
             # Check whether the previously backed up target is greedy. If not using sarsa, reset trace if non-greedy.
             Q_k = self.critics[level].table[s_k, self.G[level]].max(axis=-1)
-            G_mask = (Q_k == self.critics[level].table[s_k, self.G[level], a]) | self.sarsa
+            G_mask = (Q_k == self.critics[level].table[s_k, self.G[level], a])
 
             # Backup target.
             bootstrap_k = ((1 - G_mask) * Q_k + G_mask * G)
-            G = self.reward_func(r_mask, bootstrap_k)
+            G = r_mask + (1 - r_mask) * self.discount * bootstrap_k
 
         if self.critics[level].goal_conditioned:
             G[target_transitions[0].state] = self.critics[level].init  # Don't update transition loops

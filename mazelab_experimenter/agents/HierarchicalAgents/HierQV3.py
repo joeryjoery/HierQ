@@ -47,14 +47,14 @@ class TabularHierarchicalAgentV3(TabularHierarchicalAgent, ABC):
         self.lr_decay = lr_decay
         self.discount = discount
 
-        # Only atomic exploration by default for a given epsilon unless explicitly provided per level.
+        # Only atomic exploration by default10k for a given epsilon unless explicitly provided per level.
         self.epsilon = np.asarray([epsilon] + [0.] * (n_levels - 1), dtype=np.float32) \
             if type(epsilon) == float else np.asarray(epsilon, dtype=np.float32)
 
         self.horizons = np.full(n_levels, horizons, dtype=np.int32) \
             if type(horizons) == int else np.asarray(horizons, dtype=np.int32)
 
-        # Neighborhood sizes
+        # Maximum neighborhood sizes
         self.atomic_horizons = [int(np.prod(self.horizons[:i])) for i in range(0, self.n_levels + 1)]
 
         # Agent parameterization configuration.
@@ -87,7 +87,7 @@ class TabularHierarchicalAgentV3(TabularHierarchicalAgent, ABC):
 
         self.critics_hier = list()
         for _ in range(self.n_levels - 1):
-            c = CriticTable(0, (len(self.S), len(self.G)), goal_conditioned=True)
+            c = CriticTable(0.0, (len(self.S), len(self.G)), goal_conditioned=True)
             c.reset()  # Q_k(s, a, g) = S_pi_g[U_k(s, a), g]
 
             self.critics_hier.append(c)
@@ -148,7 +148,7 @@ class TabularHierarchicalAgentV3(TabularHierarchicalAgent, ABC):
             c.reset()
 
     def terminate_option(self, level: int, state: int, goal: int, value: float) -> bool:
-        if goal is None or goal == -1:
+        if goal is None:
             return True
         elif not self.greedy_options:
             return False
@@ -226,31 +226,30 @@ class HierQV3(TabularHierarchicalAgentV3):
         self._path = path[::-1].copy()
 
     @policy_hook
-    def get_level_action(self, s: int, g: int, level: int, explore: bool = True) -> Tuple[int, float]:
+    def get_level_action(self, s: int, g: int, level: int, explore: bool = True) -> Tuple[Optional[int], float]:
         """Sample a **Hierarchy action** (not an Environment action) from the Agent.
 
         Note: s and g are absolute indices (i.e., environment indices; not relative table indices).
         """
-        if not level:  # Epsilon greedy
-            if g == -1:
-                return np.random.randint(self.n_actions), 0  # Random walk if no concrete goal is provided.
+        if not level:
+            if g is None:
+                # Random walk if no concrete goal is provided.
+                return np.random.randint(self.n_actions), self.critic_flat.init
 
+            # Atomic, goal-conditioned, epsilon-greedy policy.
             eps = self.epsilon[0] if explore else self._TEST_EPSILON
             a = rand_argmax(self.critic_flat.table[s, :, g] * int(eps < np.random.rand()))
-
             return a, self.critic_flat.table[s, a, g]
 
         # Slice Q over the neighborhood of states conditioned on reaching goal g.
         n_k = self.U[level - 1][s]
-
-        if not len(n_k) or g == -1:  # Random walk if no concrete goal is provided, or no goal-states available.
-            return -1, 0
-
-        qs = self.critics_hier[level - 1].table[n_k, g]
+        if not len(n_k) or g == -1:
+            # Random walk if no concrete goal is provided, or no goal-states available.
+            return None, self.critics_hier[level - 1].init
 
         # Sample a neighborhood-action epsilon-greedy and return its absolute (new) goal-state + value
+        qs = self.critics_hier[level - 1].table[n_k, g]
         a = rand_argmax(qs * int((not explore) or (np.random.rand() > self.epsilon[level])))
-
         return n_k[a], qs[a]
 
     def update_flat(self, transition: GoalTransition):
@@ -259,22 +258,22 @@ class HierQV3(TabularHierarchicalAgentV3):
         # Cast TD-error and Bellman update across all goals simultaneously.
         mask = self.G == s_next  # == R_t+1
         TQ = mask + (1 - mask) * self.discount * self.critic_flat.table[s_next].max(axis=0)
-
-        # Cast TD-error over all goals
         self.critic_flat.table[s, a] += self.lr * (TQ - self.critic_flat.table[s, a])
 
     def update_hierarchy(self, transition: GoalTransition, trace: HierarchicalTrace):
         mask = self.G == transition.next_state  # == R_t+1
 
+        # Update each Hierarchy table separately for preserving correct discounting.
         for i in range(self.n_levels - 1):
             c = self.critics_hier[i]
 
+            # Construct bootstrap target from the neighborhood at the new state (--> the valid actions at s').
             n_k = self.U[i][transition.next_state]
-
             bootstrap = c.table[n_k].max(axis=0) if len(n_k) else 0.0
 
+            # Cast TD-error and Bellman update across all goals simultaneously for action 'next_state'.
+            # Note: this updates the q-values/ q(s, a)-pairs for *all* 's' that contain 'a' in their neighborhoods.
             TQ = mask + (1 - mask) * self.discount * bootstrap
-
             c.table[transition.next_state] += self.lr * (TQ - c.table[transition.next_state])
 
     def update(self, _env: gym.Env, level: int, state: int, goal_stack: List[int],

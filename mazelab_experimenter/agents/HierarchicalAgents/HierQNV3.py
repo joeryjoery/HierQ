@@ -8,26 +8,20 @@ from __future__ import annotations
 import typing
 
 import numpy as np
-from .HierQV2 import HierQV2
+from .HierQV3 import HierQV3
 
 from .utils import GoalTransition
 
 
-class HierQN(HierQV2):
+class HierQN(HierQV3):
 
     def __init__(self, observation_shape: typing.Tuple, n_actions: int, n_levels: int,
                  horizons: typing.Union[typing.List[int]], lr: float = 0.5, epsilon: float = 0.1,
                  discount: float = 0.95, n_steps: int = 1, greedy_options: bool = False,
-                 relative_actions: bool = False, relative_goals: bool = False, universal_top: bool = False,
-                 shortest_path_rewards: bool = False, sarsa: bool = False, stationary_filtering: bool = True,
-                 hindsight_targets: bool = True, hindsight_goals: bool = True,
                  legal_states: np.ndarray = None, **kwargs) -> None:
         super().__init__(
             observation_shape=observation_shape, n_actions=n_actions, n_levels=n_levels,
             horizons=horizons, lr=lr, epsilon=epsilon, discount=discount, greedy_options=greedy_options,
-            relative_actions=relative_actions, relative_goals=relative_goals, universal_top=universal_top,
-            hindsight_targets=hindsight_targets, hindsight_goals=hindsight_goals,
-            stationary_filtering=stationary_filtering, shortest_path_rewards=shortest_path_rewards, sarsa=sarsa,
             legal_states=legal_states, **kwargs
         )
         # Number of steps for backing up Q-targets.
@@ -55,7 +49,7 @@ class HierQN(HierQV2):
                 a_i = window[-1].next_state if level else window[-1].action  # shared action identifier.
                 for t in window:
                     s_t, a_t = t.state, a_i  # Extract (s, a) pair for update.
-                    if level and self.relative_actions:  # Action correction for relative action spaces.
+                    if level:  # Action correction for relative action spaces.
                         a_t = self.convert_action(level=level, reference=t.state, displaced=a_i)
 
                     # Perform Q-update over all goals simultaneously for nonzero updates.
